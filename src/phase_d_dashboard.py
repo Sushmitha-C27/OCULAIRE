@@ -133,6 +133,13 @@ def classify_and_visualize(fname, rnflt_map, metrics, scaler, kmeans,
     plt.tight_layout()
     plt.show()
 
+     # --- Save severity & generate PDF ---
+    from utils.phase_g_reporting import append_severity_record, generate_pdf_report
+    case_id = os.path.splitext(fname)[0]
+    append_severity_record(case_id, severity, metrics, label)
+    generate_pdf_report(case_id, rnflt_map, diff, risk, severity, metrics, label)
+
+
 # ==========================================================
 # 6. Runner
 # ==========================================================
