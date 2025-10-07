@@ -1,11 +1,12 @@
-
 import os, numpy as np, pandas as pd, matplotlib.pyplot as plt
 from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import KMeans
 from IPython.display import display, Markdown
 from google.colab import files
 
-# ========== Load cluster model ==========
+# ==========================================================
+# 1. Load cluster model
+# ==========================================================
 def load_cluster_model():
     cluster_csv = "/content/OCULAIRE/results/analysis/rnflt_clusters.csv"
     rnflt_raw = "/content/OCULAIRE/data/raw/RNFLT"
@@ -19,7 +20,9 @@ def load_cluster_model():
     print(f"✅ Loaded {len(df)} RNFLT cases.")
     return df, scaler, kmeans, thin_cluster, thick_cluster, rnflt_raw
 
-# ========== Upload RNFLT ==========
+# ==========================================================
+# 2. Upload RNFLT map
+# ==========================================================
 def upload_and_process_npz():
     print("📤 Please upload an RNFLT .npz file to analyze:")
     uploaded = files.upload()
@@ -28,39 +31,60 @@ def upload_and_process_npz():
     fname = list(uploaded.keys())[0]
     npz = np.load(fname, allow_pickle=True)
     rnflt_map = npz["volume"] if "volume" in npz else npz[npz.files[0]]
-    values = rnflt_map.flatten().astype(float)
+    vals = rnflt_map.flatten().astype(float)
     metrics = {
-        "mean": float(np.nanmean(values)),
-        "std": float(np.nanstd(values)),
-        "min": float(np.nanmin(values)),
-        "max": float(np.nanmax(values))
+        "mean": float(np.nanmean(vals)),
+        "std": float(np.nanstd(vals)),
+        "min": float(np.nanmin(vals)),
+        "max": float(np.nanmax(vals))
     }
     print(f"✅ Metrics extracted: {metrics}")
     return fname, rnflt_map, metrics
 
-# ========== Quadrant Metrics ==========
-def compute_quadrant_metrics(rnflt_map):
-    h, w = rnflt_map.shape
-    half_h, half_w = h // 2, w // 2
-    return {
-        "Superior": np.nanmean(rnflt_map[:half_h,:]),
-        "Inferior": np.nanmean(rnflt_map[half_h:,:]),
-        "Nasal":    np.nanmean(rnflt_map[:,:half_w]),
-        "Temporal": np.nanmean(rnflt_map[:,half_w:])
-    }
+# ==========================================================
+# 3. Compute average maps for clusters
+# ==========================================================
+def compute_average_maps(df, rnflt_raw):
+    avg_maps = {}
+    for cid in df["cluster"].unique():
+        subset = df[df["cluster"] == cid]["case_id"]
+        stack = []
+        for case in subset:
+            path = os.path.join(rnflt_raw, f"{case}.npz")
+            if os.path.exists(path):
+                data = np.load(path, allow_pickle=True)
+                arr = data["volume"] if "volume" in data else data[data.files[0]]
+                stack.append(arr)
+        if stack:
+            avg_maps[cid] = np.nanmean(np.stack(stack), axis=0)
+    print(f"✅ Computed average maps for {len(avg_maps)} clusters.")
+    return avg_maps
 
-# ========== Cluster Avg Quadrant ==========
-def load_cluster_quadrant_summary():
-    path = "/content/OCULAIRE/results/analysis/rnflt_cluster_quadrant_summary.csv"
-    if os.path.exists(path):
-        return pd.read_csv(path)
-    else:
-        print("⚠️ Cluster quadrant summary not found. Run rnflt_cluster_quadrant_summary.py.")
-        return None
+# ==========================================================
+# 4. Compute risk & severity + save image
+# ==========================================================
+def compute_risk_map(rnflt_map, healthy_avg, threshold=-10, save_path=None, fname=None):
+    if healthy_avg is None:
+        print("⚠️ No healthy average map found. Using global mean instead.")
+        healthy_avg = np.full_like(rnflt_map, np.nanmean(rnflt_map))
+    diff = rnflt_map - healthy_avg
+    risk = np.where(diff < threshold, diff, np.nan)
+    # ---- Severity (% of pixels below threshold) ----
+    total_pixels = np.isfinite(diff).sum()
+    risky_pixels = np.isfinite(risk).sum()
+    severity = (risky_pixels / total_pixels) * 100 if total_pixels > 0 else np.nan
+    # ---- Auto-save risk map ----
+    if save_path and fname:
+        os.makedirs(save_path, exist_ok=True)
+        plt.imsave(os.path.join(save_path, f"{os.path.splitext(fname)[0]}_risk.png"),
+                   risk, cmap="hot")
+    return diff, risk, severity
 
-# ========== Classification & Visualization ==========
+# ==========================================================
+# 5. Classification + visualization
+# ==========================================================
 def classify_and_visualize(fname, rnflt_map, metrics, scaler, kmeans,
-                            thin_cluster, thick_cluster, cluster_quad_summary):
+                            thin_cluster, thick_cluster, avg_maps):
     X_new = np.array([[metrics["mean"],metrics["std"],metrics["min"],metrics["max"]]])
     cluster = int(kmeans.predict(scaler.transform(X_new))[0])
     label = "Healthy-like" if cluster == thick_cluster else "Glaucoma-like"
@@ -71,38 +95,51 @@ def classify_and_visualize(fname, rnflt_map, metrics, scaler, kmeans,
     display(Markdown(f"**Interpretation:** {label}"))
     display(Markdown(f"**Mean RNFLT:** {metrics['mean']:.2f} µm"))
 
-    # --- Quadrant metrics ---
-    quads = compute_quadrant_metrics(rnflt_map)
-    display(Markdown("### 🧭 Quadrant RNFLT Thickness (µm)"))
-    df_case = pd.DataFrame(quads, index=["Uploaded"])
-    df_cluster = cluster_quad_summary.set_index("cluster")
-    healthy_avg = df_cluster.loc[thick_cluster, ["Superior","Inferior","Nasal","Temporal"]]
-    glaucoma_avg = df_cluster.loc[thin_cluster, ["Superior","Inferior","Nasal","Temporal"]]
-
-    print(df_case.T)
-    # --- Visual comparison ---
-    plt.figure(figsize=(8,4))
-    for i,q in enumerate(["Superior","Inferior","Nasal","Temporal"]):
-        case_val = quads[q]; healthy = healthy_avg[q]; glaucoma = glaucoma_avg[q]
-        color = "#D62728" if case_val < healthy-8 else "#2CA02C"
-        plt.bar(i, case_val, color=color)
-        plt.plot([i-0.3,i+0.3],[healthy,healthy],'k--',label="Healthy ref" if i==0 else "")
-        plt.plot([i-0.3,i+0.3],[glaucoma,glaucoma],'b:',label="Glaucoma ref" if i==0 else "")
-    plt.xticks(range(4),["Superior","Inferior","Nasal","Temporal"])
-    plt.ylabel("Thickness (µm)")
-    plt.title(f"Quadrant RNFLT Comparison – {label}")
-    plt.legend()
+    # --- RNFLT Map ---
+    plt.figure(figsize=(6,5))
+    plt.imshow(rnflt_map, cmap='turbo')
+    plt.title(f"RNFLT Map – {label}")
+    plt.colorbar(label="Thickness (µm)")
+    plt.axis('off')
     plt.show()
 
-    # --- RNFLT Map ---
-    plt.imshow(rnflt_map,cmap='turbo'); plt.colorbar(label="RNFLT (µm)")
-    plt.title(f"RNFLT Map – {label}"); plt.axis('off'); plt.show()
+    # --- Compute Risk Map & Severity ---
+    healthy_avg = avg_maps.get(thick_cluster) if avg_maps else None
+    diff, risk, severity = compute_risk_map(
+        rnflt_map, healthy_avg, threshold=-10,
+        save_path="/content/OCULAIRE/results/risk_maps", fname=fname)
 
-# ========== Runner ==========
+    display(Markdown(f"### ⚠️ Severity Score: **{severity:.2f}%** of area shows thinning < –10 µm"))
+
+    # --- Trio of Maps ---
+    plt.figure(figsize=(15,5))
+    plt.subplot(1,3,1)
+    plt.imshow(healthy_avg, cmap='turbo')
+    plt.title("Average Healthy RNFLT" if healthy_avg is not None else "Fallback RNFLT")
+    plt.axis('off')
+
+    plt.subplot(1,3,2)
+    plt.imshow(diff, cmap='bwr', vmin=-20, vmax=20)
+    plt.title("Difference Map (Case – Healthy)")
+    plt.colorbar(label="Δ Thickness (µm)")
+    plt.axis('off')
+
+    plt.subplot(1,3,3)
+    plt.imshow(risk, cmap='hot')
+    plt.title("Risk Map (Thinner Zones)")
+    plt.colorbar(label="Δ Thickness (µm)")
+    plt.axis('off')
+
+    plt.tight_layout()
+    plt.show()
+
+# ==========================================================
+# 6. Runner
+# ==========================================================
 def run_dashboard():
     df, scaler, kmeans, thin_cluster, thick_cluster, rnflt_raw = load_cluster_model()
-    cluster_quad_summary = load_cluster_quadrant_summary()
+    avg_maps = compute_average_maps(df, rnflt_raw)
     fname, rnflt_map, metrics = upload_and_process_npz()
     if metrics:
-        classify_and_visualize(fname, rnflt_map, metrics, scaler, kmeans,
-                               thin_cluster, thick_cluster, cluster_quad_summary)
+        classify_and_visualize(fname, rnflt_map, metrics, scaler,
+                               kmeans, thin_cluster, thick_cluster, avg_maps)
